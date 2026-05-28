@@ -1340,6 +1340,66 @@ def project_use(name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# eval — benchmark suite
+# ---------------------------------------------------------------------------
+
+@main.group("eval")
+def eval_group() -> None:
+    """Benchmark OdooDevMCP accuracy, token efficiency, and performance."""
+
+
+@eval_group.command("run")
+@click.option(
+    "--suite",
+    default="all",
+    type=click.Choice(["all", "accuracy", "tokens", "perf"]),
+    show_default=True,
+    help="Which benchmark suite to run.",
+)
+@click.option("--question", default=None, help="Run a single question by ID (e.g. FL-001).")
+@click.option("--fixture", "fixture_path", default=None, type=click.Path(),
+              help="Path to fixture addon directory (default: built-in fixture).")
+@click.option("--output", "output_path", default=None, type=click.Path(),
+              help="Directory to write reports into.")
+@click.option(
+    "--format", "fmt",
+    default="markdown",
+    type=click.Choice(["markdown", "json"]),
+    show_default=True,
+    help="Report format.",
+)
+@click.option("--verbose", "-v", is_flag=True, default=False, help="Print per-question results.")
+def eval_run(suite: str, question: Optional[str], fixture_path: Optional[str],
+             output_path: Optional[str], fmt: str, verbose: bool) -> None:
+    """Run the OdooDevMCP benchmark suite."""
+    import asyncio as _asyncio
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    # Locate the evaluate/ directory relative to this file
+    eval_dir = _Path(__file__).parent.parent.parent / "evaluate"
+    if not eval_dir.is_dir():
+        console.print(f"[red]evaluate/ directory not found at:[/red] {eval_dir}")
+        console.print("[dim]Run this command from the OdooDevMCP repository root.[/dim]")
+        raise SystemExit(1)
+
+    # Insert evaluate/ into sys.path so runner.py / grader.py / token_counter.py resolve
+    if str(eval_dir) not in _sys.path:
+        _sys.path.insert(0, str(eval_dir))
+
+    import importlib
+    runner = importlib.import_module("runner")
+
+    # Override paths if provided
+    if fixture_path:
+        runner.FIXTURE_ROOT = _Path(fixture_path).resolve()
+    if output_path:
+        runner.REPORTS_DIR = _Path(output_path).resolve()
+
+    _asyncio.run(runner.main(suite, question, verbose))
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

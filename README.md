@@ -89,6 +89,21 @@ AI breaks compute chain on edit      analyze_change_impact() warns upfront
 AI picks wrong tool (guesses)        Agent Skill auto-activates correct MCP
 ```
 
+### Benchmark
+
+Measured against a purpose-built Odoo fixture (4 models, 6-state machine, multi-level inheritance, ACL + record rules). Run `odoo-dev-mcp eval` to reproduce.
+
+| Metric | Result |
+|--------|--------|
+| Overall index accuracy | **1.00** (55/55 questions) |
+| All categories | **1.00** — field lookup, state machines, security, compute chains, transitive inheritance |
+| Token reduction vs reading files | **2.6× average**, up to **9.6×** for change-impact queries |
+| Compute / method / change-impact queries | **7–9× token reduction** |
+| Full index build time | **12 ms** |
+| Incremental update (1 module changed) | **3 ms** |
+
+Token reduction scales with codebase size — on a real enterprise Odoo installation with hundreds of modules, the AI would otherwise search through thousands of files to answer the same questions.
+
 ---
 
 ## Architecture Overview

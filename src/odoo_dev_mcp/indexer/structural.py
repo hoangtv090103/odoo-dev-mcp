@@ -70,9 +70,17 @@ def _extract_comodel(field_type: str, kwargs: dict[str, str]) -> Optional[str]:
     return None
 
 
-def _extract_selection_values(kwargs: dict[str, str]) -> str:
-    """Try to parse selection=[('key','Label'),...] into JSON."""
+def _extract_selection_values(kwargs: dict[str, str], pos_args: list[str] | None = None) -> str:
+    """Try to parse selection=[('key','Label'),...] into JSON.
+
+    Odoo allows both forms:
+      fields.Selection([('a', 'A'), ...], ...)          # positional arg #0
+      fields.Selection(selection=[('a', 'A'), ...], ...) # keyword arg
+    """
     selection = kwargs.get("selection", "")
+    # Fallback to first positional arg when keyword not found
+    if (not selection or not selection.startswith("[")) and pos_args:
+        selection = pos_args[0] if pos_args else ""
     if not selection or not selection.startswith("["):
         return "[]"
     try:
@@ -216,8 +224,8 @@ def _upsert_field(
     currency_field = _str_kwarg(kw, "currency_field")
     default_val = kw.get("default")
 
-    # JSON attributes
-    selection_values = _extract_selection_values(kw)
+    # JSON attributes — pass positional args so Selection([...]) is captured
+    selection_values = _extract_selection_values(kw, getattr(f, "args", None))
     selection_add = _extract_selection_add(kw)
     digits = _extract_digits(kw)
 
@@ -433,10 +441,14 @@ def _process_model(
         effective_name = model.model_name
 
     elif model.model_name and inherit:
-        # _name + _inherit: primary definition that also inherits
-        _upsert_model(conn, model, module_name, None, "primary")
+        # _name + _inherit: primary definition that also inherits.
+        # Store inherit_model so get_model_schema can expose the parent(s):
+        #   - string _inherit → store as-is
+        #   - list _inherit   → store as JSON so callers can parse it
+        inherit_val = json.dumps(inherit) if isinstance(inherit, list) else inherit
+        _upsert_model(conn, model, module_name, inherit_val, "primary")
         effective_name = model.model_name
-        # Also record the inheritance relationship(s)
+        # Also record the inheritance relationship(s) as extension rows
         if isinstance(inherit, str):
             _record_inherit(conn, model, module_name, inherit)
         elif isinstance(inherit, list):

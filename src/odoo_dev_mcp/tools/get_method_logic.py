@@ -102,6 +102,21 @@ async def get_method_logic(
         (model_name, method_name),
     )
 
+    # Detect super() calls by scanning the method body in the source file
+    calls_super = False
+    file_path = method_row.get("file_path")
+    body_start = method_row.get("body_start_line")
+    body_end = method_row.get("body_end_line")
+    if file_path and body_start and body_end:
+        try:
+            from pathlib import Path as _Path
+            src_lines = _Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
+            # body_start_line / body_end_line are 1-based
+            body_text = "\n".join(src_lines[body_start - 1 : body_end])
+            calls_super = "super()" in body_text
+        except Exception:
+            pass
+
     result = {
         "model": model_name,
         "method": method_name,
@@ -112,6 +127,7 @@ async def get_method_logic(
         "is_cron_target": bool(cron_row),
         "ormcache_keys": ormcache_keys,
         "api_returns_model": api_returns_model,
+        "calls_super": calls_super,
     }
 
     if include_source:

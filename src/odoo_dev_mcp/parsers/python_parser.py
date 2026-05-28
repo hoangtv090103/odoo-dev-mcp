@@ -92,6 +92,7 @@ class FieldInfo:
     field_type: str     # 'Char', 'Many2one', etc.
     kwargs: dict[str, str]
     line_number: int
+    args: list[str] = field(default_factory=list)  # positional args (e.g. Selection values)
 
 
 # ── Parser helpers ────────────────────────────────────────────────────────────
@@ -520,12 +521,13 @@ class PythonFileParser:
         if field_type not in _FIELD_TYPES:
             return None
         args_node = _child_by_field(node, "arguments")
-        _, kwargs = self._parse_call_args(args_node)
+        pos_args, kwargs = self._parse_call_args(args_node)
         return FieldInfo(
             name=name,
             field_type=field_type,
             kwargs=kwargs,
             line_number=node.start_point[0] + 1,
+            args=pos_args,
         )
 
     # ── Controller detection ──────────────────────────────────────────────────
