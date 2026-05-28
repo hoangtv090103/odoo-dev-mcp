@@ -2,6 +2,18 @@
 SQLite connection management for Odoo Dev MCP.
 
 Provides both sync (for indexer) and async (for MCP tools) access.
+
+Key design:
+  - async_query / async_query_one  : one-shot helpers (open, run, close).
+    Use for single-query tools or when simplicity matters.
+  - AsyncConn                      : context manager that keeps one connection
+    open for multiple queries.  Use in any tool that fires 3+ queries —
+    eliminates repeated open/close overhead (~6 ms per open on a typical disk).
+
+    Example:
+        async with AsyncConn(db_path) as conn:
+            row   = await conn.query_one("SELECT ...", params)
+            rows  = await conn.query("SELECT ...", params)
 """
 
 from __future__ import annotations
@@ -55,7 +67,11 @@ try:
         sql: str,
         params: tuple = (),
     ) -> list[dict]:
-        """Execute a SELECT query asynchronously and return list of dicts."""
+        """Execute a SELECT query asynchronously and return list of dicts.
+
+        Opens a new connection for each call.  Prefer AsyncConn when the
+        calling code runs multiple queries (avoids repeated open/close cost).
+        """
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
             async with conn.execute(sql, params) as cursor:
@@ -71,9 +87,47 @@ try:
         rows = await async_query(db_path, sql, params)
         return rows[0] if rows else None
 
+    class AsyncConn:
+        """Async context manager: one connection shared across many queries.
+
+        Eliminates per-query open/close overhead (~6 ms each) for tools that
+        need several queries in one logical operation.
+
+        Usage::
+
+            async with AsyncConn(db_path) as conn:
+                row  = await conn.query_one("SELECT ...", params)
+                rows = await conn.query("SELECT ...", params)
+        """
+
+        def __init__(self, db_path: Path) -> None:
+            self._db_path = db_path
+            self._conn: aiosqlite.Connection | None = None
+
+        async def __aenter__(self) -> "AsyncConn":
+            self._conn = await aiosqlite.connect(str(self._db_path))
+            self._conn.row_factory = aiosqlite.Row
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            if self._conn is not None:
+                await self._conn.close()
+                self._conn = None
+
+        async def query(self, sql: str, params: tuple = ()) -> list[dict]:
+            """Run a SELECT and return all rows as dicts."""
+            assert self._conn is not None, "AsyncConn used outside async with block"
+            async with self._conn.execute(sql, params) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(row) for row in rows]
+
+        async def query_one(self, sql: str, params: tuple = ()) -> Optional[dict]:
+            """Run a SELECT and return the first row or None."""
+            rows = await self.query(sql, params)
+            return rows[0] if rows else None
+
 except ImportError:
-    # Fallback sync implementations wrapped in async signatures
-    import asyncio
+    # ── Fallback: no aiosqlite installed — wrap sync sqlite3 ─────────────────
 
     async def async_query(db_path: Path, sql: str, params: tuple = ()) -> list[dict]:  # type: ignore[misc]
         conn = sqlite3.connect(str(db_path))
@@ -86,6 +140,32 @@ except ImportError:
     async def async_query_one(db_path: Path, sql: str, params: tuple = ()) -> Optional[dict]:  # type: ignore[misc]
         rows = await async_query(db_path, sql, params)
         return rows[0] if rows else None
+
+    class AsyncConn:  # type: ignore[no-redef]
+        """Fallback AsyncConn for environments without aiosqlite."""
+
+        def __init__(self, db_path: Path) -> None:
+            self._db_path = db_path
+            self._conn: sqlite3.Connection | None = None
+
+        async def __aenter__(self) -> "AsyncConn":
+            self._conn = sqlite3.connect(str(self._db_path))
+            self._conn.row_factory = sqlite3.Row
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+
+        async def query(self, sql: str, params: tuple = ()) -> list[dict]:
+            assert self._conn is not None
+            cur = self._conn.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
+        async def query_one(self, sql: str, params: tuple = ()) -> Optional[dict]:
+            rows = await self.query(sql, params)
+            return rows[0] if rows else None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

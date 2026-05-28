@@ -187,6 +187,9 @@ CREATE TABLE IF NOT EXISTS decorators_detail (
 );
 CREATE INDEX IF NOT EXISTS idx_dec_model_method ON decorators_detail(model_name, method_name);
 CREATE INDEX IF NOT EXISTS idx_dec_type ON decorators_detail(decorator_type);
+-- analyze_change_impact: covers WHERE model_name=? AND decorator_type=? used by all
+-- compute/onchange/constrains queries. Avoids full table scan per decorator type.
+CREATE INDEX IF NOT EXISTS idx_dec_model_type ON decorators_detail(model_name, decorator_type);
 
 -- ── HTTP routes table ────────────────────────────────────────────────────
 

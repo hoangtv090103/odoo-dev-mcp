@@ -6,50 +6,90 @@ import json as _json
 from pathlib import Path
 from typing import Callable
 
-from ..db.connection import async_query, async_query_one, json_col
+from ..db.connection import AsyncConn, json_col
 
 
-async def get_method_logic(
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+def _parse_inherit_model(raw: str | None) -> list[str]:
+    """Normalise inherit_model (plain string or JSON list) → list of parent names."""
+    if not raw:
+        return []
+    if raw.startswith("["):
+        try:
+            return _json.loads(raw)
+        except Exception:
+            return [raw]
+    return [raw]
+
+
+async def _resolve_method_row(
+    conn: AsyncConn,
     model_name: str,
     method_name: str,
-    get_db: Callable[[], Path],
-    include_source: bool = True,
-) -> dict:
-    """Get what a Python method does: decorators, state transitions it causes,
-    ORM calls it makes, constraints it enforces, and whether it overrides a parent.
+) -> tuple[dict | None, str | None]:
+    """Return (method_row, resolved_model).
 
-    Args:
-        model_name:     Odoo model technical name (e.g. 'sale.order').
-        method_name:    Python method name (e.g. 'action_confirm').
-        get_db:         Callable returning the SQLite db Path.
-        include_source: When True (default), include file path and line number
-                        so the AI can read the source directly.
-                        Pass False to get a more compact summary without
-                        file-location metadata.
+    First checks model_name directly.  If not found, walks the ancestor
+    chain (BFS via inherit_model) and returns the first ancestor that
+    defines the method.
+
+    resolved_model is None when the method is defined directly on model_name,
+    or the ancestor model name when found via inheritance.
     """
-    db_path = get_db()
-
-    method_row = await async_query_one(
-        db_path,
-        """
-        SELECT * FROM methods
-        WHERE model_name = ? AND method_name = ?
-        ORDER BY module_name
-        LIMIT 1
-        """,
+    # Direct lookup first
+    row = await conn.query_one(
+        "SELECT * FROM methods WHERE model_name = ? AND method_name = ? "
+        "ORDER BY module_name LIMIT 1",
         (model_name, method_name),
     )
+    if row:
+        return row, None
 
-    if not method_row:
-        return {
-            "error": f"Method '{method_name}' not found on model '{model_name}'.",
-            "model": model_name,
-            "method": method_name,
-        }
+    # BFS through ancestor chain
+    inherit_row = await conn.query_one(
+        "SELECT inherit_model FROM models WHERE name = ? AND inherit_type = 'primary'",
+        (model_name,),
+    )
+    if not inherit_row:
+        return None, None
 
-    # Decorator details
-    decorator_rows = await async_query(
-        db_path,
+    visited: set[str] = {model_name}
+    queue: list[str] = _parse_inherit_model(inherit_row.get("inherit_model"))
+
+    while queue:
+        ancestor = queue.pop(0)
+        if not ancestor or ancestor in visited:
+            continue
+        visited.add(ancestor)
+
+        row = await conn.query_one(
+            "SELECT * FROM methods WHERE model_name = ? AND method_name = ? "
+            "ORDER BY module_name LIMIT 1",
+            (ancestor, method_name),
+        )
+        if row:
+            return row, ancestor  # found via inheritance
+
+        # Continue up
+        gp_row = await conn.query_one(
+            "SELECT inherit_model FROM models WHERE name = ? AND inherit_type = 'primary'",
+            (ancestor,),
+        )
+        if gp_row:
+            queue.extend(_parse_inherit_model(gp_row.get("inherit_model")))
+
+    return None, None
+
+
+async def _build_decorators(
+    conn: AsyncConn,
+    model_name: str,
+    method_name: str,
+    method_row: dict,
+) -> tuple[list[str], str | None, list | None]:
+    """Return (decorators, api_returns_model, ormcache_keys)."""
+    decorator_rows = await conn.query(
         """
         SELECT decorator_type, depends_fields, depends_ctx_keys,
                constrains_fields, onchange_fields, returns_model,
@@ -60,10 +100,10 @@ async def get_method_logic(
         (model_name, method_name),
     )
 
-    # Build human-readable decorator list
-    decorators = []
-    api_returns_model = method_row.get("api_returns_model")
+    decorators: list[str] = []
+    api_returns_model: str | None = method_row.get("api_returns_model")
     ormcache_keys = json_col(method_row, "ormcache_keys")
+
     for row in decorator_rows:
         dtype = row.get("decorator_type", "")
         if dtype == "api.depends":
@@ -90,102 +130,151 @@ async def get_method_logic(
         else:
             decorators.append(f"@{dtype}")
 
-    # Also pull from methods.decorator_types for simple decorators not in detail table
-    simple_decs = json_col(method_row, "decorator_types", [])
-    for d in simple_decs:
+    # Pull simple decorators from methods.decorator_types not already captured
+    for d in json_col(method_row, "decorator_types", []):
         if d and not any(d in dec for dec in decorators):
             decorators.append(f"@{d}")
 
-    # Check if used as cron target
-    cron_row = await async_query_one(
-        db_path,
-        "SELECT xml_id FROM cron_jobs WHERE model_name = ? AND method_name = ?",
-        (model_name, method_name),
-    )
+    return decorators, api_returns_model, ormcache_keys
 
-    # Detect super() calls by scanning the method body in the source file
-    calls_super = False
+
+def _detect_calls_super(method_row: dict) -> bool:
+    """Scan method body in source file for super() calls."""
     file_path = method_row.get("file_path")
     body_start = method_row.get("body_start_line")
     body_end = method_row.get("body_end_line")
-    if file_path and body_start and body_end:
-        try:
-            src_lines = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
-            # body_start_line / body_end_line are 1-based
-            body_text = "\n".join(src_lines[body_start - 1 : body_end])
-            calls_super = "super()" in body_text
-        except Exception:
-            pass
+    if not (file_path and body_start and body_end):
+        return False
+    try:
+        src_lines = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        body_text = "\n".join(src_lines[body_start - 1 : body_end])
+        return "super()" in body_text
+    except Exception:
+        return False
 
-    # -----------------------------------------------------------------------
-    # Override detection: walk the ancestor chain and check if a same-named
-    # method exists in any parent model.  This tells the AI:
-    #   - is_override=True  → developer is overriding Odoo core / another addon
-    #   - overrides_from    → exactly which model(s) define the original method
-    #   - missing_super_call → is_override=True but calls_super=False is a
-    #                          very common Odoo bug (breaks the method chain)
-    # -----------------------------------------------------------------------
-    is_override = False
-    overrides_from: list[dict] = []
 
-    model_inherit_row = await async_query_one(
-        db_path,
+async def _detect_override(
+    conn: AsyncConn,
+    model_name: str,
+    method_name: str,
+    include_source: bool,
+) -> tuple[bool, list[dict]]:
+    """Return (is_override, overrides_from) by walking the ancestor chain."""
+    inherit_row = await conn.query_one(
         "SELECT inherit_model FROM models WHERE name = ? AND inherit_type = 'primary'",
         (model_name,),
     )
-    if model_inherit_row:
-        raw_inherit = model_inherit_row.get("inherit_model")
-        if raw_inherit:
-            if raw_inherit.startswith("["):
-                try:
-                    initial_parents: list[str] = _json.loads(raw_inherit)
-                except Exception:
-                    initial_parents = [raw_inherit]
-            else:
-                initial_parents = [raw_inherit]
+    if not inherit_row:
+        return False, []
 
-            # BFS through ancestor chain
-            visited_models: set[str] = {model_name}
-            queue: list[str] = list(initial_parents)
-            while queue:
-                ancestor = queue.pop(0)
-                if not ancestor or ancestor in visited_models:
-                    continue
-                visited_models.add(ancestor)
+    initial_parents = _parse_inherit_model(inherit_row.get("inherit_model"))
+    if not initial_parents:
+        return False, []
 
-                ancestor_method = await async_query_one(
-                    db_path,
-                    "SELECT module_name, file_path, line_number FROM methods "
-                    "WHERE model_name = ? AND method_name = ?",
-                    (ancestor, method_name),
-                )
-                if ancestor_method:
-                    is_override = True
-                    entry: dict = {"model": ancestor, "module": ancestor_method.get("module_name")}
-                    if include_source:
-                        entry["file"] = ancestor_method.get("file_path")
-                        entry["line"] = ancestor_method.get("line_number")
-                    overrides_from.append(entry)
+    is_override = False
+    overrides_from: list[dict] = []
+    visited: set[str] = {model_name}
+    queue: list[str] = list(initial_parents)
 
-                # Continue up the chain
-                grandparent_row = await async_query_one(
-                    db_path,
-                    "SELECT inherit_model FROM models WHERE name = ? AND inherit_type = 'primary'",
-                    (ancestor,),
-                )
-                if grandparent_row:
-                    raw_gp = grandparent_row.get("inherit_model")
-                    if raw_gp:
-                        if raw_gp.startswith("["):
-                            try:
-                                more: list[str] = _json.loads(raw_gp)
-                            except Exception:
-                                more = [raw_gp]
-                        else:
-                            more = [raw_gp]
-                        queue.extend(more)
+    while queue:
+        ancestor = queue.pop(0)
+        if not ancestor or ancestor in visited:
+            continue
+        visited.add(ancestor)
 
-    result = {
+        ancestor_method = await conn.query_one(
+            "SELECT module_name, file_path, line_number FROM methods "
+            "WHERE model_name = ? AND method_name = ?",
+            (ancestor, method_name),
+        )
+        if ancestor_method:
+            is_override = True
+            entry: dict = {
+                "model": ancestor,
+                "module": ancestor_method.get("module_name"),
+            }
+            if include_source:
+                entry["file"] = ancestor_method.get("file_path")
+                entry["line"] = ancestor_method.get("line_number")
+            overrides_from.append(entry)
+
+        gp_row = await conn.query_one(
+            "SELECT inherit_model FROM models WHERE name = ? AND inherit_type = 'primary'",
+            (ancestor,),
+        )
+        if gp_row:
+            queue.extend(_parse_inherit_model(gp_row.get("inherit_model")))
+
+    return is_override, overrides_from
+
+
+# ── Public tool ───────────────────────────────────────────────────────────────
+
+async def get_method_logic(
+    model_name: str,
+    method_name: str,
+    get_db: Callable[[], Path],
+    include_source: bool = True,
+) -> dict:
+    """Get what a Python method does: decorators, state transitions it causes,
+    ORM calls it makes, constraints it enforces, and whether it overrides a parent.
+
+    Automatically resolves inherited methods: if the method is not defined
+    directly on model_name but exists on an ancestor, it is returned with
+    ``is_inherited=True`` and ``resolved_on`` set to the ancestor model name.
+
+    Args:
+        model_name:     Odoo model technical name (e.g. 'sale.order').
+        method_name:    Python method name (e.g. 'action_confirm').
+        get_db:         Callable returning the SQLite db Path.
+        include_source: When True (default), include file path and line number
+                        so the AI can read the source directly.
+    """
+    db_path = get_db()
+
+    async with AsyncConn(db_path) as conn:
+        # ── 1. Resolve method row (direct or via inheritance) ─────────────────
+        method_row, resolved_on = await _resolve_method_row(conn, model_name, method_name)
+
+        if not method_row:
+            return {
+                "error": f"Method '{method_name}' not found on model '{model_name}' "
+                         "or any of its ancestors.",
+                "model": model_name,
+                "method": method_name,
+            }
+
+        # The model that actually defines this method (may differ from requested)
+        defining_model = resolved_on or model_name
+        is_inherited = resolved_on is not None
+
+        # ── 2. Decorator details (looked up on the defining model) ────────────
+        decorators, api_returns_model, ormcache_keys = await _build_decorators(
+            conn, defining_model, method_name, method_row
+        )
+
+        # ── 3. Cron target check ──────────────────────────────────────────────
+        cron_row = await conn.query_one(
+            "SELECT xml_id FROM cron_jobs WHERE model_name = ? AND method_name = ?",
+            (defining_model, method_name),
+        )
+
+        # ── 4. super() detection ──────────────────────────────────────────────
+        calls_super = _detect_calls_super(method_row)
+
+        # ── 5. Override detection ─────────────────────────────────────────────
+        # Only meaningful when the method is defined directly on the requested model.
+        # When it's inherited (is_inherited=True), there is no override.
+        if is_inherited:
+            is_override = False
+            overrides_from: list[dict] = []
+        else:
+            is_override, overrides_from = await _detect_override(
+                conn, model_name, method_name, include_source
+            )
+
+    # ── Build result ──────────────────────────────────────────────────────────
+    result: dict = {
         "model": model_name,
         "method": method_name,
         "module": method_row.get("module_name"),
@@ -197,12 +286,15 @@ async def get_method_logic(
         "ormcache_keys": ormcache_keys,
         "api_returns_model": api_returns_model,
         "calls_super": calls_super,
-        # Override info
+        # Override / inheritance info
         "is_override": is_override,
         "overrides_from": overrides_from,
-        # Common Odoo bug: overriding a method without calling super() silently
-        # breaks other addons in the chain. The AI should warn the developer.
+        # Common Odoo bug: overriding without calling super() silently breaks
+        # other addons in the MRO chain.
         "missing_super_call": is_override and not calls_super,
+        # Inheritance resolution info
+        "is_inherited": is_inherited,
+        "resolved_on": resolved_on,  # None = defined directly on model_name
     }
 
     if include_source:
