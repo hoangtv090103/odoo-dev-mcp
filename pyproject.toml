@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "odoo-dev-mcp"
+version = "0.1.0"
+description = "MCP server for Odoo developer productivity — knowledge graph, static analysis, 12 dev tools"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Hoang Tran" }]
+keywords = ["odoo", "mcp", "developer-tools", "static-analysis"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+  "fastmcp>=2.0.0",
+  "tree-sitter>=0.21.0",
+  "tree-sitter-python>=0.21.0",
+  "lxml>=4.9.0",
+  "click>=8.1.0",
+  "rich>=13.0.0",
+  "aiofiles>=23.0.0",
+  "watchdog>=3.0.0",
+  "platformdirs>=4.0.0",
+  "xxhash>=3.0.0",
+  "aiosqlite>=0.19.0",
+]
+
+[project.scripts]
+odoo-dev-mcp = "odoo_dev_mcp.cli:main"
+odoo-mcp = "odoo_dev_mcp.cli:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "pytest-asyncio>=0.21",
+  "ruff>=0.1.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/odoo_dev_mcp"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

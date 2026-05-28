@@ -1,0 +1,75 @@
+"""Tool 13: build_index — trigger full or incremental index from AI."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Callable, Optional
+
+
+async def build_index(
+    get_config,
+    addons_paths: Optional[list[str]] = None,
+    force_rebuild: bool = False,
+) -> dict:
+    """Build or incrementally update the Odoo knowledge graph index.
+
+    Call this tool when:
+    - The user asks to index/reindex their project.
+    - get_index_status reports stale files.
+    - The user provides new addons paths for the first time.
+
+    Args:
+        addons_paths:  List of absolute paths to Odoo addons directories.
+                       If omitted, uses paths from .odoodevmcp.toml or
+                       the currently configured project.
+        force_rebuild: If True, drops and rebuilds the entire index from scratch.
+                       If False (default), only re-indexes modules whose files
+                       have changed since the last run.
+    """
+    from ..indexer.pipeline import run_full_index
+    from ..config import resolve_project_config
+
+    try:
+        if addons_paths:
+            # Build config from provided paths
+            addons_path_str = ":".join(addons_paths)
+            config = resolve_project_config(addons_path_str, Path.cwd())
+        else:
+            config = get_config()
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"Could not resolve project config: {exc}",
+            "hint": "Provide addons_paths as a list of absolute directory paths.",
+        }
+
+    incremental = not force_rebuild and config.db_path.exists()
+
+    try:
+        result = run_full_index(
+            config,
+            reset=force_rebuild,
+            incremental=incremental,
+        )
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+        }
+
+    return {
+        "success": True,
+        "project": result.project_name,
+        "mode": "force_rebuild" if force_rebuild else ("incremental" if incremental else "full"),
+        "modules_total": result.modules_count,
+        "modules_indexed": result.changed_modules,
+        "modules_skipped": result.skipped_modules,
+        "models": result.models_count,
+        "fields": result.fields_count,
+        "methods": result.methods_count,
+        "views": result.views_count,
+        "routes": result.routes_count,
+        "duration_seconds": round(result.duration_seconds, 2),
+        "errors": result.errors,
+        "db_path": str(config.db_path),
+    }
