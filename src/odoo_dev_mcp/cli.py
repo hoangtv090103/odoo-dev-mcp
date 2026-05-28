@@ -1080,15 +1080,18 @@ def cmd_query(
 # ---------------------------------------------------------------------------
 
 @main.command("graph")
-@click.option("--model", "model_name", default=None, help="Odoo model name to visualize (e.g. sale.order).")
-@click.option("--module", "module_name", default=None, help="Module name to visualize (e.g. sale).")
-@click.option("--depth", default=2, show_default=True, help="Hop depth for expanding related models/modules (1–3).")
+@click.option("--model", "model_name", default=None, help="Odoo model name to centre on (e.g. sale.order).")
+@click.option("--module", "module_name", default=None, help="Module name to centre on (e.g. sale).")
+@click.option("--all", "all_models", is_flag=True, default=False,
+              help="Full-codebase graph: all models with inheritance + field relations. Ignores --model/--module.")
+@click.option("--depth", default=2, show_default=True, help="Hop depth for related models/modules (1–4).")
 @click.option("--output", "output_path", default=None, help="Output HTML file path. Default: <name>_graph.html")
 @click.option("--addons-path", "addons_path", default=None, help="Colon-separated addons paths.")
 @click.option("--open", "open_browser", is_flag=True, default=False, help="Open the generated HTML in the browser.")
 def cmd_graph(
     model_name: Optional[str],
     module_name: Optional[str],
+    all_models: bool,
     depth: int,
     output_path: Optional[str],
     addons_path: Optional[str],
@@ -1097,14 +1100,16 @@ def cmd_graph(
     """Generate an interactive HTML knowledge graph from the Odoo index.
 
     Shows ALL connections between components: model inheritance, relational
-    fields, compute chains, views, state machines, actions, and module deps —
-    in a single interactive graph with filter controls.
+    fields, compute chains, views, state machines, security rules, cron jobs,
+    actions, and module dependencies — with filter controls, zoom buttons,
+    and PNG export.
 
     \b
     Examples:
       odoo-dev-mcp graph --model sale.order
       odoo-dev-mcp graph --model sale.order --depth 2 --open
       odoo-dev-mcp graph --module sale --depth 3
+      odoo-dev-mcp graph --all --output full_graph.html
     """
     from .graph_html import generate_graph_html
 
@@ -1117,19 +1122,23 @@ def cmd_graph(
         )
         raise SystemExit(1)
 
-    if not model_name and not module_name:
-        console.print("[red]Error:[/red] Provide --model or --module.")
+    if not all_models and not model_name and not module_name:
+        console.print("[red]Error:[/red] Provide --model, --module, or --all.")
         raise SystemExit(1)
 
-    stem = model_name or module_name
+    if all_models:
+        stem = "full_codebase"
+    else:
+        stem = model_name or module_name
     safe_stem = (stem or "graph").replace(".", "_").replace("/", "_")
     out_file = Path(output_path) if output_path else Path.cwd() / f"{safe_stem}_graph.html"
 
+    target_label = "All models (full codebase)" if all_models else stem
     console.print(
         Panel(
-            f"[bold]Target:[/bold] {stem}\n"
-            f"[bold]Depth:[/bold] {depth}\n"
-            f"[bold]Output:[/bold] {out_file}",
+            f"[bold]Target:[/bold] {target_label}\n"
+            + (f"[bold]Depth:[/bold] {depth}\n" if not all_models else "")
+            + f"[bold]Output:[/bold] {out_file}",
             title="OdooDevMCP — Knowledge Graph",
             expand=False,
         )
@@ -1141,7 +1150,8 @@ def cmd_graph(
                 db_path=config.db_path,
                 model_name=model_name,
                 module_name=module_name,
-                depth=max(1, min(depth, 3)),
+                depth=max(1, min(depth, 4)),
+                all_models=all_models,
             )
         except ValueError as exc:
             console.print(f"[red]Error:[/red] {exc}")
@@ -1149,9 +1159,6 @@ def cmd_graph(
 
     out_file.write_text(html, encoding="utf-8")
 
-    # Count nodes/edges from the HTML for display
-    import re as _re
-    nc = len(_re.findall(r'"id":', html))
     console.print(f"[green]✓[/green] Saved [bold]{out_file}[/bold]  ({len(html)//1024}KB)")
     console.print(f"[dim]{title}[/dim]")
 
