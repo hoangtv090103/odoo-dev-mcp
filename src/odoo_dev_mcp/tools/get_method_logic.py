@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json as _json
 from pathlib import Path
 from typing import Callable
 
@@ -15,7 +16,7 @@ async def get_method_logic(
     include_source: bool = True,
 ) -> dict:
     """Get what a Python method does: decorators, state transitions it causes,
-    ORM calls it makes, and constraints it enforces.
+    ORM calls it makes, constraints it enforces, and whether it overrides a parent.
 
     Args:
         model_name:     Odoo model technical name (e.g. 'sale.order').
@@ -109,17 +110,85 @@ async def get_method_logic(
     body_end = method_row.get("body_end_line")
     if file_path and body_start and body_end:
         try:
-            from pathlib import Path as _Path
-            src_lines = _Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
+            src_lines = Path(file_path).read_text(encoding="utf-8", errors="replace").splitlines()
             # body_start_line / body_end_line are 1-based
             body_text = "\n".join(src_lines[body_start - 1 : body_end])
             calls_super = "super()" in body_text
         except Exception:
             pass
 
+    # -----------------------------------------------------------------------
+    # Override detection: walk the ancestor chain and check if a same-named
+    # method exists in any parent model.  This tells the AI:
+    #   - is_override=True  → developer is overriding Odoo core / another addon
+    #   - overrides_from    → exactly which model(s) define the original method
+    #   - missing_super_call → is_override=True but calls_super=False is a
+    #                          very common Odoo bug (breaks the method chain)
+    # -----------------------------------------------------------------------
+    is_override = False
+    overrides_from: list[dict] = []
+
+    model_inherit_row = await async_query_one(
+        db_path,
+        "SELECT inherit_model FROM models WHERE name = ? AND inherit_type = 'primary'",
+        (model_name,),
+    )
+    if model_inherit_row:
+        raw_inherit = model_inherit_row.get("inherit_model")
+        if raw_inherit:
+            if raw_inherit.startswith("["):
+                try:
+                    initial_parents: list[str] = _json.loads(raw_inherit)
+                except Exception:
+                    initial_parents = [raw_inherit]
+            else:
+                initial_parents = [raw_inherit]
+
+            # BFS through ancestor chain
+            visited_models: set[str] = {model_name}
+            queue: list[str] = list(initial_parents)
+            while queue:
+                ancestor = queue.pop(0)
+                if not ancestor or ancestor in visited_models:
+                    continue
+                visited_models.add(ancestor)
+
+                ancestor_method = await async_query_one(
+                    db_path,
+                    "SELECT module_name, file_path, line_number FROM methods "
+                    "WHERE model_name = ? AND method_name = ?",
+                    (ancestor, method_name),
+                )
+                if ancestor_method:
+                    is_override = True
+                    entry: dict = {"model": ancestor, "module": ancestor_method.get("module_name")}
+                    if include_source:
+                        entry["file"] = ancestor_method.get("file_path")
+                        entry["line"] = ancestor_method.get("line_number")
+                    overrides_from.append(entry)
+
+                # Continue up the chain
+                grandparent_row = await async_query_one(
+                    db_path,
+                    "SELECT inherit_model FROM models WHERE name = ? AND inherit_type = 'primary'",
+                    (ancestor,),
+                )
+                if grandparent_row:
+                    raw_gp = grandparent_row.get("inherit_model")
+                    if raw_gp:
+                        if raw_gp.startswith("["):
+                            try:
+                                more: list[str] = _json.loads(raw_gp)
+                            except Exception:
+                                more = [raw_gp]
+                        else:
+                            more = [raw_gp]
+                        queue.extend(more)
+
     result = {
         "model": model_name,
         "method": method_name,
+        "module": method_row.get("module_name"),
         "decorators": decorators,
         "state_transitions": json_col(method_row, "state_transitions", []),
         "calls_models": json_col(method_row, "calls_models", []),
@@ -128,6 +197,12 @@ async def get_method_logic(
         "ormcache_keys": ormcache_keys,
         "api_returns_model": api_returns_model,
         "calls_super": calls_super,
+        # Override info
+        "is_override": is_override,
+        "overrides_from": overrides_from,
+        # Common Odoo bug: overriding a method without calling super() silently
+        # breaks other addons in the chain. The AI should warn the developer.
+        "missing_super_call": is_override and not calls_super,
     }
 
     if include_source:

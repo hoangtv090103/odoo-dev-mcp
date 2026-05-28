@@ -128,6 +128,66 @@ async def _collect_inherited_fields(
     return inherited
 
 
+async def _collect_inherited_methods(
+    db_path: Path,
+    inherit_parents: str | list[str],
+    visited: set[str],
+) -> list[dict]:
+    """Recursively collect methods from parent models (BFS), with inherited_from attribution.
+
+    Returns a list of dicts: {name, module, decorators, inherited_from}.
+    """
+    inherited: list[dict] = []
+
+    parents = [inherit_parents] if isinstance(inherit_parents, str) else inherit_parents
+
+    for parent_name in parents:
+        if not parent_name or parent_name in visited:
+            continue
+        visited.add(parent_name)
+
+        parent_method_rows = await async_query(
+            db_path,
+            "SELECT method_name, decorator_types, module_name FROM methods "
+            "WHERE model_name = ? ORDER BY method_name",
+            (parent_name,),
+        )
+        for r in parent_method_rows:
+            inherited.append(
+                {
+                    "name": r["method_name"],
+                    "module": r["module_name"],
+                    "decorators": json_col(r, "decorator_types", []),
+                    "inherited_from": parent_name,
+                }
+            )
+
+        # Recurse up
+        parent_model_rows = await async_query(
+            db_path,
+            "SELECT * FROM models WHERE name = ? ORDER BY inherit_type",
+            (parent_name,),
+        )
+        if parent_model_rows:
+            parent_primary = next(
+                (r for r in parent_model_rows if r.get("inherit_type") == "primary"),
+                parent_model_rows[0],
+            )
+            raw_parent_inherit = parent_primary.get("inherit_model")
+            if raw_parent_inherit:
+                if raw_parent_inherit.startswith("["):
+                    try:
+                        grandparent_inherit: str | list[str] = json.loads(raw_parent_inherit)
+                    except Exception:
+                        grandparent_inherit = raw_parent_inherit
+                else:
+                    grandparent_inherit = raw_parent_inherit
+                deeper = await _collect_inherited_methods(db_path, grandparent_inherit, visited)
+                inherited.extend(deeper)
+
+    return inherited
+
+
 async def get_model_schema(
     model_name: str,
     get_db: Callable[[], Path],
@@ -237,6 +297,41 @@ async def get_model_schema(
                 if ifield["name"] not in own_names:
                     fields.append(ifield)
 
+    # -----------------------------------------------------------------------
+    # Methods: own methods defined on this model (compact list)
+    # Plus inherited methods from parent chain with inherited_from attribution.
+    # This lets the AI know what methods are callable/overrideable on the model.
+    # -----------------------------------------------------------------------
+    own_method_rows = await async_query(
+        db_path,
+        "SELECT method_name, decorator_types, module_name FROM methods "
+        "WHERE model_name = ? ORDER BY method_name",
+        (model_name,),
+    )
+    methods_list: list[dict] = [
+        {
+            "name": r["method_name"],
+            "module": r["module_name"],
+            "decorators": json_col(r, "decorator_types", []),
+        }
+        for r in own_method_rows
+    ]
+
+    if include_inherited and inherit_parents:
+        visited_m: set[str] = {model_name}
+        inherited_methods = await _collect_inherited_methods(db_path, inherit_parents, visited_m)
+        own_method_names = {m["name"] for m in methods_list}
+        for im in inherited_methods:
+            if im["name"] not in own_method_names:
+                methods_list.append(im)
+            # If same name exists in own methods, flag the own method as an override
+            else:
+                for om in methods_list:
+                    if om["name"] == im["name"] and "module" in om:
+                        om.setdefault("overrides", []).append(
+                            {"model": im["inherited_from"], "module": im["module"]}
+                        )
+
     result = {
         "model": model_name,
         "class_name": primary_row.get("python_class"),
@@ -250,6 +345,7 @@ async def get_model_schema(
         "file": primary_row.get("file_path"),
         "line": primary_row.get("line_number"),
         "fields": fields,
+        "methods": methods_list,
         "extensions": extensions,
         "total_fields": total_fields_count,
         "compact": compact,
