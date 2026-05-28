@@ -6,7 +6,7 @@ OdooDevMCP builds a local SQLite knowledge graph by statically analysing your Od
 
 Built on [FastMCP](https://github.com/jlowin/fastmcp) · Python 3.10+ · SQLite · tree-sitter · lxml
 
-> **Inspired by** [code-review-graph](https://github.com/nicktringali/code-review-graph) — a project that demonstrated the power of pre-building a code knowledge graph for AI-assisted code review. OdooDevMCP applies the same core idea to the Odoo ecosystem, extending it with Odoo-specific semantics: model inheritance chains, XML view resolution, state machines, security ACLs, and 7-phase incremental indexing across Python, XML, CSV, and JavaScript.
+> **Inspired by** [code-review-graph](https://github.com/tirth8205/code-review-graph) by [tirth8205](https://github.com/tirth8205) — a project that builds a persistent structural map of any codebase using Tree-sitter so AI assistants read only what matters (up to 49× fewer tokens). OdooDevMCP applies the same core idea to the Odoo ecosystem, extending it with Odoo-specific semantics: model inheritance chains, XML view resolution, state machines, security ACLs, and 7-phase incremental indexing across Python, XML, CSV, and JavaScript.
 
 ---
 
@@ -172,12 +172,6 @@ The AI calls `get_project_context()` first to get an orientation map, then uses 
 ---
 
 ## Installation
-
-```bash
-pip install odoo-dev-mcp
-```
-
-Or from source:
 
 ```bash
 git clone https://github.com/your-org/odoo-dev-mcp
@@ -786,7 +780,7 @@ ruff format src/
 
 ## Acknowledgments
 
-OdooDevMCP was inspired by **[code-review-graph](https://github.com/nicktringali/code-review-graph)** — a project that proved the concept of pre-building a code knowledge graph so that an AI assistant can reason about a codebase structurally rather than reading raw files on every query.
+OdooDevMCP was inspired by **[code-review-graph](https://github.com/tirth8205/code-review-graph)** by [tirth8205](https://github.com/tirth8205) — a project that builds a persistent structural map of any codebase using Tree-sitter so AI assistants read only what matters, achieving up to 49× fewer tokens on daily coding tasks.
 
 That core insight — *build the graph once, query it many times* — is exactly what OdooDevMCP brings to the Odoo ecosystem. We extended it with:
 
@@ -795,7 +789,7 @@ That core insight — *build the graph once, query it many times* — is exactly
 - 18 MCP tools covering the full Odoo development lifecycle
 - Agent Skill auto-activation so the AI reaches for the right tool automatically
 
-Thank you to [nicktringali](https://github.com/nicktringali) for the original inspiration.
+Thank you to [tirth8205](https://github.com/tirth8205) for the original inspiration.
 
 ---
 
