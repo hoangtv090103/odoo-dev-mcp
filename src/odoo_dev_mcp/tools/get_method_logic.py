@@ -23,28 +23,51 @@ def _parse_inherit_model(raw: str | None) -> list[str]:
     return [raw]
 
 
+_PRIORITY_ORDER = """\
+    CASE WHEN COALESCE(state_transitions, '[]') != '[]' THEN 0 ELSE 1 END ASC,
+    CASE WHEN COALESCE(calls_models, '[]') != '[]' THEN 0 ELSE 1 END ASC,
+    CASE WHEN raises_validation = 1 THEN 0 ELSE 1 END ASC,
+    module_name ASC\
+"""
+
+
 async def _resolve_method_row(
     conn: AsyncConn,
     model_name: str,
     method_name: str,
-) -> tuple[dict | None, str | None]:
-    """Return (method_row, resolved_model).
+) -> tuple[dict | None, str | None, list[dict]]:
+    """Return (best_method_row, resolved_model, all_implementations).
 
-    First checks model_name directly.  If not found, walks the ancestor
-    chain (BFS via inherit_model) and returns the first ancestor that
-    defines the method.
+    *best_method_row* is the implementation with the richest semantic content
+    (state_transitions → calls_models → raises_validation → module_name),
+    NOT simply the alphabetically first module.
 
-    resolved_model is None when the method is defined directly on model_name,
+    *resolved_model* is None when the method is found directly on model_name,
     or the ancestor model name when found via inheritance.
+
+    *all_implementations* lists every module that defines the method on
+    the resolved model, so callers can surface alternative overrides.
     """
-    # Direct lookup first
-    row = await conn.query_one(
-        "SELECT * FROM methods WHERE model_name = ? AND method_name = ? "
-        "ORDER BY module_name LIMIT 1",
+    # Direct lookup — pick richest implementation, also fetch all variants
+    rows = await conn.query(
+        f"SELECT * FROM methods WHERE model_name = ? AND method_name = ? "
+        f"ORDER BY {_PRIORITY_ORDER}",
         (model_name, method_name),
     )
-    if row:
-        return row, None
+    if rows:
+        best = rows[0]
+        all_impls = [
+            {
+                "module": r.get("module_name"),
+                "file": r.get("file_path"),
+                "line": r.get("line_number"),
+                "has_state_transitions": bool(
+                    r.get("state_transitions") and r["state_transitions"] != "[]"
+                ),
+            }
+            for r in rows
+        ]
+        return best, None, all_impls
 
     # BFS through ancestor chain
     inherit_row = await conn.query_one(
@@ -52,7 +75,7 @@ async def _resolve_method_row(
         (model_name,),
     )
     if not inherit_row:
-        return None, None
+        return None, None, []
 
     visited: set[str] = {model_name}
     queue: list[str] = _parse_inherit_model(inherit_row.get("inherit_model"))
@@ -63,13 +86,25 @@ async def _resolve_method_row(
             continue
         visited.add(ancestor)
 
-        row = await conn.query_one(
-            "SELECT * FROM methods WHERE model_name = ? AND method_name = ? "
-            "ORDER BY module_name LIMIT 1",
+        rows = await conn.query(
+            f"SELECT * FROM methods WHERE model_name = ? AND method_name = ? "
+            f"ORDER BY {_PRIORITY_ORDER}",
             (ancestor, method_name),
         )
-        if row:
-            return row, ancestor  # found via inheritance
+        if rows:
+            best = rows[0]
+            all_impls = [
+                {
+                    "module": r.get("module_name"),
+                    "file": r.get("file_path"),
+                    "line": r.get("line_number"),
+                    "has_state_transitions": bool(
+                        r.get("state_transitions") and r["state_transitions"] != "[]"
+                    ),
+                }
+                for r in rows
+            ]
+            return best, ancestor, all_impls  # found via inheritance
 
         # Continue up
         gp_row = await conn.query_one(
@@ -79,7 +114,7 @@ async def _resolve_method_row(
         if gp_row:
             queue.extend(_parse_inherit_model(gp_row.get("inherit_model")))
 
-    return None, None
+    return None, None, []
 
 
 async def _build_decorators(
@@ -234,7 +269,9 @@ async def get_method_logic(
 
     async with AsyncConn(db_path) as conn:
         # ── 1. Resolve method row (direct or via inheritance) ─────────────────
-        method_row, resolved_on = await _resolve_method_row(conn, model_name, method_name)
+        method_row, resolved_on, all_implementations = await _resolve_method_row(
+            conn, model_name, method_name
+        )
 
         if not method_row:
             return {
@@ -295,6 +332,11 @@ async def get_method_logic(
         # Inheritance resolution info
         "is_inherited": is_inherited,
         "resolved_on": resolved_on,  # None = defined directly on model_name
+        # All modules that define this method on the same model — present when
+        # multiple addons override the same method (e.g. delivery_mondialrelay
+        # AND np_sale both define action_confirm on sale.order).  The first
+        # entry is the one shown above (richest semantics first).
+        "all_implementations": all_implementations,
     }
 
     if include_source:

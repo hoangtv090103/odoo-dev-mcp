@@ -239,13 +239,54 @@ def _focus_block(conn, model_name: str) -> dict:
     has_acl = bool(conn.execute("SELECT 1 FROM access_rules   WHERE model_name=? LIMIT 1", (model_name,)).fetchone())
     has_cron= bool(conn.execute("SELECT 1 FROM cron_jobs      WHERE model_name=? LIMIT 1", (model_name,)).fetchone())
 
-    # Inherited models (upstream + downstream count)
-    parents  = [r[0] for r in conn.execute(
-        "SELECT inherit_model FROM models WHERE name=? AND inherit_model IS NOT NULL", (model_name,)
+    # Primary module that defines this model
+    primary_module = row["module_name"] or ""
+
+    # Inherited models (upstream parents) — parse JSON array if needed
+    raw_parents = [r[0] for r in conn.execute(
+        "SELECT inherit_model FROM models WHERE name=? AND inherit_model IS NOT NULL",
+        (model_name,),
     ).fetchall()]
-    children_count = conn.execute(
-        "SELECT COUNT(*) FROM models WHERE inherit_model=?", (model_name,)
-    ).fetchone()[0]
+    parents: list[str] = []
+    for p in raw_parents:
+        if p and p.startswith("["):
+            try:
+                items = json.loads(p)
+                parents.extend(x for x in items if isinstance(x, str) and x)
+            except Exception:
+                parents.append(p)
+        elif p:
+            parents.append(p)
+
+    # Modules that EXTEND this model via _inherit (NOT primary definitions).
+    # Each module may add new fields/methods on top of the base model.
+    # Group by module_name → list of methods they add.
+    ext_rows = conn.execute(
+        """
+        SELECT m.module_name, mt.method_name
+        FROM models m
+        LEFT JOIN methods mt ON mt.model_name = m.name AND mt.module_name = m.module_name
+        WHERE m.name = ? AND m.inherit_type = '_inherit' AND m.module_name IS NOT NULL
+        ORDER BY m.module_name, mt.method_name
+        """,
+        (model_name,),
+    ).fetchall()
+
+    # Build: { module_name: [method1, method2, ...] }
+    ext_modules: dict[str, list[str]] = {}
+    for r in ext_rows:
+        mod = r["module_name"]
+        meth = r["method_name"]
+        if mod not in ext_modules:
+            ext_modules[mod] = []
+        if meth and meth not in ext_modules[mod]:
+            ext_modules[mod].append(meth)
+
+    # Trim method lists to top 6 per module (keep token count low)
+    extending_modules = {
+        mod: methods[:6] + (["…"] if len(methods) > 6 else [])
+        for mod, methods in sorted(ext_modules.items())
+    }
 
     # Relational connections
     related = conn.execute(
@@ -265,29 +306,50 @@ def _focus_block(conn, model_name: str) -> dict:
 
     # Build suggested tool chain
     suggested: list[str] = [
-        f'get_model_schema("{model_name}")          — full field/method list',
+        f'get_model_schema("{model_name}")           — all fields + methods from every module',
     ]
     if has_sm:
-        suggested.append(f'get_state_machine("{model_name}")       — states & transitions')
+        suggested.append(f'get_state_machine("{model_name}")        — states & transitions')
     if has_acl:
-        suggested.append(f'get_access_control("{model_name}")      — ACL & record rules')
-    suggested.append(f'get_constraints("{model_name}")           — validation rules')
+        suggested.append(f'get_access_control("{model_name}")       — ACL & record rules')
+    suggested.append(f'get_constraints("{model_name}")            — validation rules')
     if vc:
         suggested.append(f'resolve_xml_view("{model_name}", "form") — merged form view')
-    suggested.append(f'analyze_change_impact("{model_name}")     — dependency blast radius')
-    suggested.append(f'trace_odoo_path("{model_name}", depth=2)  — multi-hop graph walk')
+    # Always suggest trace_business_flow — it reveals customisations on related models
+    # (e.g. np_stock extending stock.picking when analysing sale.order)
+    suggested.append(
+        f'trace_business_flow("{model_name}")       — downstream O2m/M2m models + who extends each'
+    )
+    suggested.append(f'analyze_change_impact("{model_name}")      — dependency blast radius')
+    if extending_modules:
+        for mod in list(extending_modules)[:3]:
+            suggested.append(
+                f'search_odoo_entities("{mod}", types=["method"]) — methods added by {mod}'
+            )
+
+    # Compose note about extensions so AI immediately understands scope
+    ext_note: str = ""
+    if extending_modules:
+        mod_list = ", ".join(extending_modules.keys())
+        ext_note = (
+            f"{len(extending_modules)} module(s) extend {model_name}: {mod_list}. "
+            f"Call get_model_schema(\"{model_name}\") to see ALL fields/methods across every module."
+        )
+    else:
+        ext_note = f"No other modules extend {model_name} (only defined in {primary_module})."
 
     return {
-        "model":           model_name,
-        "description":     row["description"] or "",
-        "module":          row["module_name"] or "",
-        "abstract":        bool(row["abstract"]),
-        "transient":       bool(row["transient"]),
-        "quick_facts":     facts,
-        "inherits_from":   parents,
-        "extended_by":     children_count,
-        "related_models":  related_models,
-        "suggested_tools": suggested,
+        "model":              model_name,
+        "description":        row["description"] or "",
+        "module":             primary_module,
+        "abstract":           bool(row["abstract"]),
+        "transient":          bool(row["transient"]),
+        "quick_facts":        facts,
+        "inherits_from":      parents,
+        "extending_modules":  extending_modules,   # { module_name: [method1, method2, ...] }
+        "extension_note":     ext_note,            # Plain-text hint for AI
+        "related_models":     related_models,
+        "suggested_tools":    suggested,
     }
 
 
@@ -297,6 +359,7 @@ def _navigation_guide() -> dict:
         "START_HERE":        "get_project_context(focus_model='...')  — always call first",
         "explore_model":     "get_model_schema(model)                 — fields, methods, inheritance",
         "compact_schema":    "get_model_schema(model, compact=True)   — one-line-per-field summary",
+        "business_flow":     "trace_business_flow(model)              — downstream O2m/M2m models + who extends each",
         "search":            "search_odoo_entities(query, types=[])   — find anything by name/keyword",
         "follow_graph":      "trace_odoo_path(model, depth=2)         — multi-hop relationship walk",
         "state_machine":     "get_state_machine(model)                — states & transitions",

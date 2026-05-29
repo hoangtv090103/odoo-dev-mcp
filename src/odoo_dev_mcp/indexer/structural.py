@@ -441,19 +441,40 @@ def _process_model(
         effective_name = model.model_name
 
     elif model.model_name and inherit:
-        # _name + _inherit: primary definition that also inherits.
-        # Store inherit_model so get_model_schema can expose the parent(s):
-        #   - string _inherit → store as-is
-        #   - list _inherit   → store as JSON so callers can parse it
-        inherit_val = json.dumps(inherit) if isinstance(inherit, list) else inherit
-        _upsert_model(conn, model, module_name, inherit_val, "primary")
-        effective_name = model.model_name
-        # Also record the inheritance relationship(s) as extension rows
-        if isinstance(inherit, str):
-            _record_inherit(conn, model, module_name, inherit)
-        elif isinstance(inherit, list):
-            for inh in inherit:
-                _record_inherit(conn, model, module_name, inh)
+        # Two sub-cases:
+        #
+        # A) Pure extension — no explicit _name was written in source.
+        #    The parser derived model_name from the string _inherit value,
+        #    so model_name == inherit.  This is the common pattern:
+        #        class SaleOrder(models.Model):
+        #            _inherit = 'sale.order'
+        #    Must be stored as inherit_type='_inherit' so that tools like
+        #    get_project_context / trace_business_flow can discover it.
+        #
+        # B) New model — explicit _name that differs from _inherit.
+        #        class SaleOrderXP(models.Model):
+        #            _name    = 'sale.order.xp'
+        #            _inherit = 'sale.order'
+        #    Stored as inherit_type='primary' for the new model, plus an
+        #    extension row so the parent can be navigated.
+        if isinstance(inherit, str) and model.model_name == inherit:
+            # Case A: pure extension, no explicit _name
+            _upsert_model(conn, model, module_name, inherit, "_inherit")
+            effective_name = inherit
+        else:
+            # Case B: new model with explicit _name + _inherit
+            # Store inherit_model so get_model_schema can expose the parent(s):
+            #   - string _inherit → store as-is
+            #   - list _inherit   → store as JSON so callers can parse it
+            inherit_val = json.dumps(inherit) if isinstance(inherit, list) else inherit
+            _upsert_model(conn, model, module_name, inherit_val, "primary")
+            effective_name = model.model_name
+            # Also record the inheritance relationship(s) as extension rows
+            if isinstance(inherit, str):
+                _record_inherit(conn, model, module_name, inherit)
+            elif isinstance(inherit, list):
+                for inh in inherit:
+                    _record_inherit(conn, model, module_name, inh)
 
     elif isinstance(inherit, str):
         # Only _inherit (string) — extending existing model

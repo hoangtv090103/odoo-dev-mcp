@@ -9,10 +9,25 @@ Stops early when the token budget is consumed so responses stay bounded.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections import deque
 from pathlib import Path
 from typing import Callable, List, Optional
+
+
+def _parse_inherit(raw: str | None) -> list[str]:
+    """Normalise inherit_model column — plain string or JSON array."""
+    if not raw:
+        return []
+    raw = raw.strip()
+    if raw.startswith("["):
+        try:
+            items = json.loads(raw)
+            return [x for x in items if isinstance(x, str) and x]
+        except Exception:
+            pass
+    return [raw] if raw else []
 
 
 # Approximate tokens per node/edge entry (conservative)
@@ -164,13 +179,13 @@ async def trace_odoo_path(
                     (model,),
                 ).fetchall()
                 for r in rows:
-                    parent = r["inherit_model"]
-                    target_node = f"m:{parent}"
-                    _add_node(target_node, "model", parent)
-                    _add_edge(model_node, target_node, "inherit", "_inherit")
-                    if parent not in visited_models:
-                        visited_models.add(parent)
-                        queue.append((parent, hop + 1))
+                    for parent in _parse_inherit(r["inherit_model"]):
+                        target_node = f"m:{parent}"
+                        _add_node(target_node, "model", parent)
+                        _add_edge(model_node, target_node, "inherit", "_inherit")
+                        if parent not in visited_models:
+                            visited_models.add(parent)
+                            queue.append((parent, hop + 1))
 
                 # downstream _inherit (children)
                 children = conn.execute(

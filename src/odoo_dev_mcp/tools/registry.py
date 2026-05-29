@@ -1,4 +1,4 @@
-"""MCP tool registry — registers all 18 tools onto a FastMCP instance."""
+"""MCP tool registry — registers all 19 tools onto a FastMCP instance."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from .get_model_graph import get_model_graph as _get_model_graph
 from .get_project_context import get_project_context as _get_project_context
 from .search_entities import search_odoo_entities as _search_odoo_entities
 from .trace_path import trace_odoo_path as _trace_odoo_path
+from .trace_business_flow import trace_business_flow as _trace_business_flow
 
 
 def register_tools(
@@ -32,7 +33,7 @@ def register_tools(
     get_db: Callable[[], Path],
     get_config: Callable,
 ) -> None:
-    """Register all 18 tools onto the FastMCP instance.
+    """Register all 19 tools onto the FastMCP instance.
 
     Args:
         mcp:        The FastMCP server instance.
@@ -288,3 +289,20 @@ def register_tools(
     ) -> dict:
         """Generate Mermaid diagram or JSON graph for a model or module."""
         return await _get_model_graph(model_name, graph_type, depth, output_format, get_db)
+
+    @mcp.tool(
+        description=(
+            "Trace the full business flow from a model: shows the root model's "
+            "extension modules PLUS every One2many/Many2many-connected downstream model "
+            "and what custom modules extend each one. "
+            "Use this when get_project_context shows a model is extended but you need to "
+            "understand the full pipeline (e.g. sale.order → stock.picking → account.move "
+            "and which project-specific modules customise each step). "
+            "Returns extending_modules with method names and custom_fields per module, "
+            "plus a state_machine summary for each model that has one. "
+            "Much faster than calling get_model_schema on every related model manually."
+        )
+    )
+    async def trace_business_flow(start_model: str) -> dict:
+        """Surface extending-module customisations across a model's downstream relational chain."""
+        return await _trace_business_flow(start_model, get_db)
